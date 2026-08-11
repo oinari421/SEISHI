@@ -323,14 +323,15 @@
         PC：WASD / 矢印キーで移動・Spaceでタックル・Eでアイテム
       </p>
     </section>
-    <!-- キャラクタータイプ選択画面 -->
+    <!-- 能力選択画面：一人用は開始前、対戦は全員入室後に表示する -->
     <section id="select" class="screen" style="display: none">
       <div class="sub">SELECT YOUR TYPE</div>
-      <h2>泳ぎ方を選ぶ</h2>
+      <h2 id="selectTitle">泳ぎ方を選ぶ</h2>
       <div class="types" id="types"></div>
-      <br /><button class="primary" onclick="afterType()">
+      <br /><button class="primary" id="typeConfirm" onclick="afterType()">
         このタイプで決定 →
       </button>
+      <p id="selectStatus" class="status"></p>
     </section>
     <!-- ローカル対戦ロビー：部屋作成、招待コード参加、人数設定 -->
     <section id="lobby" class="screen" style="display: none">
@@ -352,6 +353,7 @@
               <option>3</option>
               <option selected>4</option>
               <option>5</option>
+              <option>6</option>
             </select>
           </div>
           <div class="field">
@@ -527,7 +529,8 @@
         lobbyMembers = [],
         matchPlayers = 5,
         lastNetSend = 0,
-        countdownId = 0;
+        countdownId = 0,
+        localPhase = "lobby";
       // キャラクター選択ボタンをKの設定から自動生成する。
       types.innerHTML = K.map(
         (k, i) =>
@@ -545,13 +548,9 @@
       function beginMode(m) {
         mode = m;
         title.style.display = "none";
-        select.style.display = "flex";
-      }
-      // キャラ決定後、一人用なら試合開始、対戦ならロビーへ移動。
-      function afterType() {
-        select.style.display = "none";
-        if (mode === "solo") start();
-        else {
+        if (mode === "solo") {
+          openAbilitySelect("一人用の能力を選ぶ");
+        } else {
           lobby.style.display = "flex";
           let q = new URLSearchParams(location.search).get("join");
           if (q) {
@@ -559,6 +558,33 @@
             joinCode.value = q;
             joinRoom();
           }
+        }
+      }
+      function openAbilitySelect(titleText = "能力を選ぶ") {
+        selectTitle.textContent = titleText;
+        selectStatus.textContent = "";
+        typeConfirm.disabled = false;
+        typeConfirm.textContent = "このタイプで決定 →";
+        lobby.style.display = title.style.display = result.style.display = "none";
+        select.style.display = "flex";
+      }
+      // 一人用は即開始。対戦では選択内容をホストへ提出して全員を待つ。
+      function afterType() {
+        if (mode === "solo") {
+          select.style.display = "none";
+          start();
+          return;
+        }
+        typeConfirm.disabled = true;
+        typeConfirm.textContent = "選択済み";
+        selectStatus.textContent = "他のプレイヤーの選択を待っています…";
+        if (isHost) {
+          let me = lobbyMembers.find((m) => m.id === 0);
+          if (me) me.kind = kind;
+          broadcastLobby();
+          tryStartAfterAbilities();
+        } else if (connections[0]?.open) {
+          connections[0].send({ type: "ability", kind });
         }
       }
       // =========================================================
@@ -602,7 +628,8 @@
           inviteCode.value = code;
           inviteArea.style.display = "block";
           hostStart.style.display = "inline-block";
-          lobbyMembers = [{ id: 0, name: "ホスト", kind }];
+          localPhase = "lobby";
+          lobbyMembers = [{ id: 0, name: "ホスト", kind: null }];
           renderLobby();
           netStatus.textContent = "友人の参加を待っています";
         });
@@ -611,7 +638,7 @@
       }
       // 新しい参加者を受け入れ、入力情報をホスト側で受信する。
       function acceptGuest(c) {
-        if (lobbyMembers.length >= +playerLimit.value) {
+        if (localPhase !== "lobby" || lobbyMembers.length >= +playerLimit.value) {
           c.on("open", () =>
             c.send({ type: "error", message: "この部屋は満員です" }),
           );
@@ -622,12 +649,18 @@
         c.on("data", (d) => {
           if (d.type === "hello") {
             let id = lobbyMembers.length;
-            lobbyMembers.push({ id, name: "ゲスト " + id, kind: d.kind });
+            lobbyMembers.push({ id, name: "ゲスト " + id, kind: null });
             c.playerId = id;
             c.send({ type: "welcome", id, settings: getSettings() });
             broadcastLobby();
           } else if (d.type === "input") remoteInputs[c.playerId] = d.input;
           else if (d.type === "use") applyItem(c.playerId);
+          else if (d.type === "ability" && localPhase === "ability") {
+            let member = lobbyMembers.find((m) => m.id === c.playerId);
+            if (member && K.some((k) => k[0] === d.kind)) member.kind = d.kind;
+            broadcastLobby();
+            tryStartAfterAbilities();
+          }
         });
         c.on("close", () => {
           lobbyMembers = lobbyMembers.filter((x) => x.id !== c.playerId);
@@ -651,7 +684,7 @@
           let c = peer.connect(code.toLowerCase(), { reliable: true });
           connections = [c];
           c.on("open", () => {
-            c.send({ type: "hello", kind });
+            c.send({ type: "hello" });
             netStatus.textContent = "接続しました。ホストの開始を待っています";
           });
           c.on("data", guestData);
@@ -673,6 +706,10 @@
         if (d.type === "lobby") {
           lobbyMembers = d.members;
           renderLobby();
+        }
+        if (d.type === "selectAbility") {
+          localPhase = "ability";
+          openAbilitySelect(`P${myId + 1}の能力を選ぶ`);
         }
         if (d.type === "start") {
           matchPlayers = d.count;
@@ -717,10 +754,11 @@
         renderLobby();
       }
       function renderLobby() {
+        const faces = ["普通顔", "怒り顔", "眠そう", "泣き顔", "キラキラ", "ジト目"];
         players.innerHTML = lobbyMembers
           .map(
             (m, i) =>
-              `<div class="playerrow"><span>${i ? "●" : "★"} ${m.name}</span><b>${K.find((k) => k[0] === m.kind)?.[2] || ""}</b></div>`,
+              `<div class="playerrow"><span>${i ? "●" : "★"} P${m.id + 1} ${m.name}</span><b>${faces[m.id] || ""}${localPhase === "ability" ? " / " + (K.find((k) => k[0] === m.kind)?.[2] || "選択中") : ""}</b></div>`,
           )
           .join("");
         if (isHost) {
@@ -752,6 +790,7 @@
         if (peer) peer.destroy();
         peer = null;
         lobbyMembers = [];
+        localPhase = "lobby";
       }
       function startLocalMatch() {
         let settings = getSettings();
@@ -760,6 +799,19 @@
           return;
         }
         matchPlayers = settings.limit;
+        localPhase = "ability";
+        lobbyMembers.forEach((m) => (m.kind = null));
+        connections.forEach(
+          (c) => c.open && c.send({ type: "selectAbility" }),
+        );
+        broadcastLobby();
+        openAbilitySelect("P1の能力を選ぶ");
+      }
+      // 人間プレイヤー全員の能力が決まった時だけ、ホストが試合を開始する。
+      function tryStartAfterAbilities() {
+        if (!isHost || localPhase !== "ability") return;
+        if (!lobbyMembers.length || lobbyMembers.some((m) => !m.kind)) return;
+        localPhase = "game";
         connections.forEach(
           (c) => c.open && c.send({ type: "start", count: matchPlayers }),
         );
@@ -921,7 +973,8 @@
       // 5. 1ラウンド分のキャラ・卵子・アイテムを生成
       // =========================================================
       function make() {
-        let colors = ["#fff", "#ff8ea1", "#85d4ff", "#ffd66b", "#b49cff"],
+        // 全員を白色に統一し、入室順の顔パーツで見分ける。
+        let colors = Array(6).fill("#fff"),
           humanCount = mode === "local" ? lobbyMembers.length : 1,
           ks = Array.from(
             { length: matchPlayers },
@@ -1510,6 +1563,45 @@
       // 9. Canvas描画
       // =========================================================
 
+      // 入室順（P1～P6）に対応した顔を、進行方向を向いた頭へ描く。
+      function drawFace(ctx, id) {
+        ctx.save();
+        ctx.strokeStyle = ctx.fillStyle = "#173040";
+        ctx.lineWidth = 1.8;
+        ctx.lineCap = "round";
+        const eye = (x, y, rx = 2.1, ry = 2.8) => {
+          ctx.beginPath();
+          ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+          ctx.fill();
+        };
+        if (id === 0) {
+          eye(7, -5); eye(7, 5);
+        } else if (id === 1) {
+          eye(7, -5, 1.8, 2.4); eye(7, 5, 1.8, 2.4);
+          ctx.beginPath();
+          ctx.moveTo(3, -8); ctx.lineTo(9, -6);
+          ctx.moveTo(3, 8); ctx.lineTo(9, 6); ctx.stroke();
+        } else if (id === 2) {
+          ctx.beginPath();
+          ctx.moveTo(4, -5); ctx.lineTo(10, -5);
+          ctx.moveTo(4, 5); ctx.lineTo(10, 5); ctx.stroke();
+        } else if (id === 3) {
+          eye(7, -5); eye(7, 5);
+          ctx.fillStyle = "#69cbe5";
+          ctx.beginPath(); ctx.ellipse(4, 9, 1.8, 3.2, 0, 0, 7); ctx.fill();
+        } else if (id === 4) {
+          eye(7, -5, 3.2, 3.8); eye(7, 5, 3.2, 3.8);
+          ctx.fillStyle = "white";
+          ctx.fillRect(6, -7, 1.5, 1.5); ctx.fillRect(6, 3, 1.5, 1.5);
+        } else {
+          ctx.beginPath();
+          ctx.moveTo(3, -5); ctx.lineTo(11, -5);
+          ctx.moveTo(3, 5); ctx.lineTo(11, 5); ctx.stroke();
+          eye(8, -5, 1.4, 1.4); eye(8, 5, 1.4, 1.4);
+        }
+        ctx.restore();
+      }
+
       // プレイヤーを中心にカメラを動かし、マップ全体を描画する。
       function draw() {
         let x = cv.getContext("2d"),
@@ -1633,6 +1725,8 @@
           x.beginPath();
           x.ellipse(0, 0, 19, 14, 0, 0, 7);
           x.fill();
+          x.shadowBlur = 0;
+          drawFace(x, o.id);
           x.restore();
           x.fillStyle = "white";
           x.textAlign = "center";
