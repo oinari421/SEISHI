@@ -158,7 +158,9 @@ let kind = "chemo",
   abilityTimerId = 0,
   abilityTimeoutId = 0,
   abilityDeadline = 0,
-  matchKinds = [];
+  matchKinds = [],
+  guestInputTimer = 0,
+  guestSyncTimer = 0;
 // キャラクター選択ボタンをKの設定から自動生成する。
 types.innerHTML = K.map(
   (k, i) =>
@@ -308,6 +310,10 @@ function acceptGuest(c) {
       c.send({ type: "welcome", id, settings: getSettings() });
       broadcastLobby();
     } else if (d.type === "input") remoteInputs[c.playerId] = d.input;
+    else if (d.type === "readyForState" && localPhase === "game") {
+      // ゲスト側のCanvas準備後に、最新の試合状態を再送する。
+      sendStateTo(c);
+    }
     else if (d.type === "ability" && localPhase === "ability") {
       let member = lobbyMembers.find((m) => m.id === c.playerId);
       if (member && K.some((k) => k[0] === d.kind)) member.kind = d.kind;
@@ -371,12 +377,21 @@ function guestData(d) {
     setActiveMap(d.mapIndex);
     scores = Array(matchPlayers).fill(0);
     round = 1;
-    enterMatchScreen(() => showMapIntro());
+    S = null;
+    enterMatchScreen(() => {
+      showMapIntro();
+      requestGuestState();
+    });
     netStatus.textContent = "";
     startGuestControls();
   }
   if (d.type === "countdown") showCountdown(d.value);
   if (d.type === "state") {
+    clearInterval(guestSyncTimer);
+    guestSyncTimer = 0;
+    if (Number.isInteger(d.mapIndex) && d.mapIndex !== activeMapIndex) {
+      setActiveMap(d.mapIndex);
+    }
     S = d.S;
     elapsed = d.elapsed;
     round = d.round;
@@ -439,6 +454,9 @@ function peerError(e) {
 }
 function closePeer() {
   stopAbilityTimer();
+  clearInterval(guestInputTimer);
+  clearInterval(guestSyncTimer);
+  guestInputTimer = guestSyncTimer = 0;
   connections.forEach((c) => c.close());
   connections = [];
   if (peer) peer.destroy();
@@ -493,6 +511,7 @@ function tryStartAfterAbilities() {
 // ゲスト端末のキー入力を50msごとにホストへ送信する。
 function startGuestControls() {
   cancelAnimationFrame(raf);
+  clearInterval(guestInputTimer);
   const send = () => {
     if (!connections[0]?.open) return;
     connections[0].send({
@@ -501,7 +520,17 @@ function startGuestControls() {
     });
     tackleQueued = false;
   };
-  setInterval(send, 50);
+  guestInputTimer = setInterval(send, 50);
+}
+// 初期stateを受け取るまで、ホストへ再送を要求する。
+function requestGuestState() {
+  clearInterval(guestSyncTimer);
+  const request = () => {
+    if (S || !connections[0]?.open) return;
+    connections[0].send({ type: "readyForState" });
+  };
+  request();
+  guestSyncTimer = setInterval(request, 250);
 }
 // =========================================================
 // 4. マップ判定・CPUの経路探索
@@ -774,6 +803,37 @@ function sendCountdown(value) {
       (c) => c.open && c.send({ type: "countdown", value }),
     );
 }
+// PeerJSで確実に送れるよう、Setなどを含まない試合状態へ変換する。
+function makeNetworkState() {
+  if (!S) return null;
+  return {
+    swimmers: S.swimmers.map((o) => ({
+      ...o,
+      visitedRooms: Array.from(o.visitedRooms || []),
+    })),
+    eggs: S.eggs.map((e) => ({ ...e })),
+  };
+}
+function createStateMessage() {
+  const networkState = makeNetworkState();
+  if (!networkState) return null;
+  return {
+    type: "state",
+    S: networkState,
+    elapsed,
+    round,
+    scores: [...scores],
+    mapIndex: activeMapIndex,
+  };
+}
+function sendStateTo(connection) {
+  if (!connection?.open) return;
+  const message = createStateMessage();
+  if (message) connection.send(message);
+}
+function broadcastState() {
+  connections.forEach(sendStateTo);
+}
 // ラウンドを初期化し「3→2→1→START」後にゲームループを開始。
 function newRound(showIntroFirst = false) {
   let id = ++countdownId;
@@ -786,14 +846,7 @@ function newRound(showIntroFirst = false) {
   cancelAnimationFrame(raf);
   draw();
   if (mode === "local" && isHost) {
-    let state = {
-      type: "state",
-      S,
-      elapsed,
-      round,
-      scores,
-    };
-    connections.forEach((c) => c.open && c.send(state));
+    broadcastState();
   }
   const beginCountdown = () => {
     if (id !== countdownId) return;
@@ -1159,14 +1212,7 @@ function loop(t) {
   draw();
   if (mode === "local" && isHost && t - lastNetSend > 65) {
     lastNetSend = t;
-    let state = {
-      type: "state",
-      S,
-      elapsed,
-      round,
-      scores,
-    };
-    connections.forEach((c) => c.open && c.send(state));
+    broadcastState();
   }
   if (S.eggs.every((e) => e.claimed) || elapsed > 60) {
     if (round < 3) {
