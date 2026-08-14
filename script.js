@@ -169,6 +169,8 @@ let kind = "chemo",
   uiToastTimeout = 0,
   guestRenderLast = 0,
   guestSelfPrediction = null,
+  guestPredictedTackleQueued = false,
+  remoteSnapshots = [],
   stateTarget = null,
   statePrevious = null,
   stateReceivedAt = 0,
@@ -182,10 +184,14 @@ let kind = "chemo",
 // =========================================================
 const NETWORK_SEND_MS = 33,
   MAX_BUFFERED_BYTES = 64 * 1024,
-  // 相手を先読みする最大時間。大きすぎると壁抜けして見えるため100msまで。
-  REMOTE_PREDICTION_MS = 100,
-  // 表示座標が予測位置へ近づく割合。1にすると再びカクつきやすい。
-  REMOTE_SMOOTHING = 0.38,
+  // 相手は100ms過去の2状態間を描画し、予測外れによる巻き戻りを防ぐ。
+  REMOTE_INTERPOLATION_DELAY_MS = 100,
+  // 自分とホストの差が15px未満なら補正せず、細かな揺れを出さない。
+  LOCAL_IGNORE_ERROR_PX = 15,
+  // 60pxを超えた時だけ即座にホスト位置へ戻す。
+  LOCAL_SNAP_ERROR_PX = 60,
+  // 中程度の誤差を約0.2秒かけて戻す。
+  LOCAL_CORRECTION_SECONDS = 0.2,
   // ホストからこの時間データが届かなければ、切断確認へ移る。
   HOST_SILENCE_MS = 2500,
   DISCONNECT_GRACE_MS = 10000,
@@ -518,6 +524,8 @@ function guestData(d) {
     round = 1;
     stateTarget = statePrevious = null;
     guestSelfPrediction = null;
+    guestPredictedTackleQueued = false;
+    remoteSnapshots = [];
     guestRenderLast = 0;
     enterMatchScreen(() => {
       connections[0]?.open && connections[0].send({ type: "ready" });
@@ -537,6 +545,11 @@ function guestData(d) {
     statePrevious = stateTarget || d.S;
     stateTarget = d.S;
     stateReceivedAt = performance.now();
+    remoteSnapshots.push({ receivedAt: stateReceivedAt, state: d.S });
+    // 補間に必要な分だけ保持し、古い通信状態は破棄する。
+    remoteSnapshots = remoteSnapshots
+      .filter((snapshot) => stateReceivedAt - snapshot.receivedAt <= 500)
+      .slice(-12);
     if (!guestSelfPrediction && d.S.swimmers?.[myId])
       guestSelfPrediction = { ...d.S.swimmers[myId] };
     S = buildGuestDisplayState(stateReceivedAt, 0);
@@ -581,80 +594,106 @@ function cloneGameState(source) {
 }
 
 // =========================================================
-// ゲスト側の表示予測
-// 判定は一切変更せず、見た目だけを先に動かして通信遅延を隠す。
+// ゲスト側の表示分離
+// 自分はローカル物理、相手は過去2状態の補間。判定はホストのみ。
 // =========================================================
 function buildGuestDisplayState(now, dt) {
   if (!stateTarget) return S;
   const result = cloneGameState(stateTarget);
-  const previousDisplay = S;
-  const age = Math.min(REMOTE_PREDICTION_MS, now - stateReceivedAt) / 1000;
+  const remoteFrame = getInterpolatedRemoteFrame(
+    now - REMOTE_INTERPOLATION_DELAY_MS,
+  );
 
   result.swimmers.forEach((o, i) => {
-    if (o.secured) return;
-
     if (i === myId) {
       updateGuestSelfPrediction(o, dt);
-      Object.assign(o, {
-        x: guestSelfPrediction.x,
-        y: guestSelfPrediction.y,
-        facingX: guestSelfPrediction.facingX,
-        facingY: guestSelfPrediction.facingY,
-      });
+      Object.assign(o, guestSelfPrediction);
       return;
     }
-
-    // 相手は最新の速度から最大100ms先の座標を予測する。
-    const predictedX = o.x + (o.vx || 0) * age;
-    const predictedY = o.y + (o.vy || 0) * age;
-    const old = previousDisplay?.swimmers?.[i];
-    if (!old || Math.hypot(old.x - predictedX, old.y - predictedY) > 180) {
-      o.x = predictedX;
-      o.y = predictedY;
-    } else {
-      o.x = old.x + (predictedX - old.x) * REMOTE_SMOOTHING;
-      o.y = old.y + (predictedY - old.y) * REMOTE_SMOOTHING;
-    }
+    // 相手は先読みしない。補間済みのホスト確定座標だけを表示する。
+    const remote = remoteFrame?.swimmers?.[i];
+    if (remote) Object.assign(o, remote);
   });
   return result;
 }
 
-// 自分のキャラクターはキー入力をその場で見た目へ反映する。
-// ホストの確定座標との差は毎フレーム少しずつ戻し、大幅な差だけ即補正する。
+// 描画時刻を挟む2つの受信状態を探し、その間だけを線形補間する。
+// 急な方向転換や壁衝突でも未来予測をしないため、巻き戻りが発生しにくい。
+function getInterpolatedRemoteFrame(renderTime) {
+  if (!remoteSnapshots.length) return stateTarget;
+  let before = remoteSnapshots[0];
+  let after = remoteSnapshots[remoteSnapshots.length - 1];
+  for (let i = 0; i < remoteSnapshots.length; i++) {
+    if (remoteSnapshots[i].receivedAt <= renderTime) before = remoteSnapshots[i];
+    if (remoteSnapshots[i].receivedAt >= renderTime) {
+      after = remoteSnapshots[i];
+      break;
+    }
+  }
+  if (before === after) return before.state;
+  const span = after.receivedAt - before.receivedAt || 1;
+  const alpha = C((renderTime - before.receivedAt) / span, 0, 1);
+  const frame = cloneGameState(after.state);
+  frame.swimmers.forEach((o, i) => {
+    const a = before.state.swimmers[i];
+    const b = after.state.swimmers[i];
+    if (!a || !b || a.secured !== b.secured) return;
+    o.x = a.x + (b.x - a.x) * alpha;
+    o.y = a.y + (b.y - a.y) * alpha;
+    o.facingX = a.facingX + (b.facingX - a.facingX) * alpha;
+    o.facingY = a.facingY + (b.facingY - a.facingY) * alpha;
+  });
+  return frame;
+}
+
+// 自分はホストと同じupdateHuman・moveInWorld・地形効果をローカル実行する。
+// 小さな誤差を無視することで、毎フレームの引っ張り合いを防止する。
 function updateGuestSelfPrediction(authoritative, dt) {
-  if (!guestSelfPrediction)
-    guestSelfPrediction = { ...authoritative };
+  if (!guestSelfPrediction) guestSelfPrediction = { ...authoritative };
 
   const errorX = authoritative.x - guestSelfPrediction.x;
   const errorY = authoritative.y - guestSelfPrediction.y;
   const errorDistance = Math.hypot(errorX, errorY);
-  if (errorDistance > 140) {
+  if (errorDistance > LOCAL_SNAP_ERROR_PX) {
     guestSelfPrediction.x = authoritative.x;
     guestSelfPrediction.y = authoritative.y;
-  } else {
-    const correction = Math.min(1, dt * 7);
+    guestSelfPrediction.vx = authoritative.vx;
+    guestSelfPrediction.vy = authoritative.vy;
+  } else if (errorDistance >= LOCAL_IGNORE_ERROR_PX) {
+    const correction = Math.min(1, dt / LOCAL_CORRECTION_SECONDS);
     guestSelfPrediction.x += errorX * correction;
     guestSelfPrediction.y += errorY * correction;
   }
 
-  const ix = (keys.d || keys.arrowright ? 1 : 0) -
-    (keys.a || keys.arrowleft ? 1 : 0);
-  const iy = (keys.s || keys.arrowdown ? 1 : 0) -
-    (keys.w || keys.arrowup ? 1 : 0);
-  const length = Math.hypot(ix, iy) || 1;
-  const dx = ix / length;
-  const dy = iy / length;
+  // ホスト確定の状態異常・能力値を取り込み、位置と速度だけ予測値を維持する。
+  const predictedMotion = {
+    x: guestSelfPrediction.x,
+    y: guestSelfPrediction.y,
+    vx: guestSelfPrediction.vx,
+    vy: guestSelfPrediction.vy,
+    facingX: guestSelfPrediction.facingX,
+    facingY: guestSelfPrediction.facingY,
+  };
+  Object.assign(guestSelfPrediction, authoritative, predictedMotion);
 
-  if ((ix || iy) && authoritative.stun <= 0) {
-    guestSelfPrediction.facingX = dx;
-    guestSelfPrediction.facingY = dy;
-    const speed = moveSpeed(authoritative);
-    const nextX = guestSelfPrediction.x + dx * speed * dt;
-    const nextY = guestSelfPrediction.y + dy * speed * dt;
-    if (!blocked(nextX, guestSelfPrediction.y, 20))
-      guestSelfPrediction.x = nextX;
-    if (!blocked(guestSelfPrediction.x, nextY, 20))
-      guestSelfPrediction.y = nextY;
+  updateHuman(
+    guestSelfPrediction,
+    { keys, tackle: guestPredictedTackleQueued },
+    dt,
+  );
+  guestPredictedTackleQueued = false;
+  if (!guestSelfPrediction.secured) {
+    moveInWorld(guestSelfPrediction, dt);
+    const water = zoneAt(activeMap.water, guestSelfPrediction);
+    if (water) {
+      const reduction = guestSelfPrediction.kind === "rheo" ? 0.3 : 1;
+      guestSelfPrediction.x += water.dx * water.strength * reduction * dt;
+      guestSelfPrediction.y += water.dy * water.strength * reduction * dt;
+    }
+    if (zoneAt(activeMap.slime, guestSelfPrediction)) {
+      guestSelfPrediction.vx *= 0.94;
+      guestSelfPrediction.vy *= 0.94;
+    }
   }
 }
 function guestRenderLoop(now) {
@@ -1204,6 +1243,8 @@ function toastMsg(s) {
 // =========================================================
 function queueTackle() {
   tackleQueued = true;
+  // ゲスト画面でもタックル開始を即時表示するため、予測側へ別途保持する。
+  if (mode === "local" && !isHost) guestPredictedTackleQueued = true;
 }
 onkeydown = (e) => {
   keys[e.key.toLowerCase()] = 1;

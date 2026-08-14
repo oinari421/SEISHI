@@ -45,12 +45,17 @@ ZIPを各自のPCで直接開くだけでは、招待コードによる別端末
 - v4：ゲスト側でCanvasだけ空白になる状態コピー処理を修正
 - v5：ゲスト自身の入力予測、相手の速度予測、通信詰まり時の古い状態破棄を追加
 - v5：ホストのheartbeatを2.5秒監視し、切断時は10秒表示後にロビーへ戻る
+- v6：相手の未来予測を廃止し、約100ms過去の2状態間を補間
+- v6：自分はホストと同じ移動・壁・水流・粘液処理をローカル実行
+- v6：自分の誤差15px未満は無視、15～60pxは0.2秒補正、60px超は即修正
 
 【ラグ調整箇所（script.js上部）】
 - NETWORK_SEND_MS：ホストの状態送信間隔（初期値33ms）
 - MAX_BUFFERED_BYTES：送信待ちを破棄する基準（初期値64KB）
-- REMOTE_PREDICTION_MS：相手位置の最大先読み時間（初期値100ms）
-- REMOTE_SMOOTHING：相手表示が予測位置へ近づく割合（初期値0.38）
+- REMOTE_INTERPOLATION_DELAY_MS：相手を何ms過去で補間するか（初期値100ms）
+- LOCAL_IGNORE_ERROR_PX：自分の位置誤差を無視する範囲（初期値15px）
+- LOCAL_SNAP_ERROR_PX：自分を即座にホスト位置へ戻す基準（初期値60px）
+- LOCAL_CORRECTION_SECONDS：中程度の誤差を戻す時間（初期値0.2秒）
 - HOST_SILENCE_MS：ホスト無通信を切断と判断する時間（初期値2500ms）
 【タックル操作】
 Spaceキーまたは画面下のTACKLEボタンで、向いている方向へ突進します。
