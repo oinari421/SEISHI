@@ -159,8 +159,20 @@ let kind = "chemo",
   abilityTimeoutId = 0,
   abilityDeadline = 0,
   matchKinds = [],
+  guestRenderRaf = 0,
   guestInputTimer = 0,
-  guestSyncTimer = 0;
+  guestDisconnectTimer = 0,
+  stateTarget = null,
+  statePrevious = null,
+  stateReceivedAt = 0,
+  readyGuestIds = new Set(),
+  roundStartTimeout = 0,
+  roundCountdownScheduled = false,
+  disconnectTimers = new Map();
+const NETWORK_SEND_MS = 40,
+  INTERPOLATION_MS = 90,
+  DISCONNECT_GRACE_MS = 10000,
+  READY_WAIT_MS = 5000;
 // キャラクター選択ボタンをKの設定から自動生成する。
 types.innerHTML = K.map(
   (k, i) =>
@@ -304,14 +316,19 @@ function acceptGuest(c) {
   c.on("open", () => {});
   c.on("data", (d) => {
     if (d.type === "hello") {
-      let id = lobbyMembers.length;
+      let id = 1;
+      while (lobbyMembers.some((m) => m.id === id)) id++;
       lobbyMembers.push({ id, name: "ゲスト " + id, kind: null });
       c.playerId = id;
       c.send({ type: "welcome", id, settings: getSettings() });
       broadcastLobby();
-    } else if (d.type === "input") remoteInputs[c.playerId] = d.input;
-    else if (d.type === "readyForState" && localPhase === "game") {
-      // ゲスト側のCanvas準備後に、最新の試合状態を再送する。
+    } else if (d.type === "input" && localPhase === "game") {
+      remoteInputs[c.playerId] = d.input;
+    } else if (d.type === "ready" && localPhase === "game") {
+      readyGuestIds.add(c.playerId);
+      sendStateTo(c);
+      tryBeginSynchronizedRound();
+    } else if (d.type === "stateRequest" && localPhase === "game") {
       sendStateTo(c);
     }
     else if (d.type === "ability" && localPhase === "ability") {
@@ -322,10 +339,48 @@ function acceptGuest(c) {
     }
   });
   c.on("close", () => {
-    lobbyMembers = lobbyMembers.filter((x) => x.id !== c.playerId);
     connections = connections.filter((x) => x !== c);
-    broadcastLobby();
+    readyGuestIds.delete(c.playerId);
+    delete remoteInputs[c.playerId];
+    if (localPhase === "game") {
+      beginCpuTakeover(c.playerId);
+    } else {
+      lobbyMembers = lobbyMembers.filter((x) => x.id !== c.playerId);
+      normalizeLobbyIds();
+      broadcastLobby();
+      if (localPhase === "ability") tryStartAfterAbilities();
+    }
   });
+}
+function normalizeLobbyIds() {
+  lobbyMembers.sort((a, b) => a.id - b.id);
+  lobbyMembers.forEach((member, index) => {
+    member.id = index;
+  });
+  connections.forEach((connection) => {
+    const member = lobbyMembers.find((m) => m.name === `ゲスト ${connection.playerId}`);
+    if (!member) return;
+    connection.playerId = member.id;
+    if (connection.open)
+      connection.send({ type: "welcome", id: member.id, settings: getSettings() });
+  });
+}
+function beginCpuTakeover(playerId) {
+  if (!Number.isInteger(playerId) || disconnectTimers.has(playerId)) return;
+  toastMsg(`P${playerId + 1}が切断。10秒後にCPUが代行します`);
+  const timer = setTimeout(() => {
+    disconnectTimers.delete(playerId);
+    const swimmer = S?.swimmers?.[playerId];
+    if (!swimmer || swimmer.cpuTakeover) return;
+    swimmer.human = false;
+    swimmer.cpuTakeover = true;
+    swimmer.path = [];
+    swimmer.pathIndex = 0;
+    swimmer.lockedEgg = null;
+    nextRoomTarget(swimmer);
+    toastMsg(`P${playerId + 1}をCPUが代行します`);
+  }, DISCONNECT_GRACE_MS);
+  disconnectTimers.set(playerId, timer);
 }
 // 招待コードを使ってホストの部屋へ接続する。
 function joinRoom() {
@@ -347,12 +402,28 @@ function joinRoom() {
       netStatus.textContent = "接続しました。ホストの開始を待っています";
     });
     c.on("data", guestData);
-    c.on(
-      "close",
-      () => (netStatus.textContent = "ホストとの接続が切れました"),
-    );
+    c.on("close", handleHostDisconnect);
   });
   peer.on("error", peerError);
+}
+function handleHostDisconnect() {
+  if (localPhase !== "game") {
+    netStatus.textContent = "ホストとの接続が切れました";
+    return;
+  }
+  toastMsg("ホストとの接続が切れました。10秒間待機します");
+  clearTimeout(guestDisconnectTimer);
+  guestDisconnectTimer = setTimeout(() => {
+    cancelAnimationFrame(guestRenderRaf);
+    clearInterval(guestInputTimer);
+    localPhase = "lobby";
+    game.style.display = "none";
+    lobby.style.display = "flex";
+    inviteArea.style.display = "block";
+    hostStart.style.display = "none";
+    netStatus.textContent =
+      "ホストが切断したため試合を中断しました。部屋へ入り直してください。";
+  }, DISCONNECT_GRACE_MS);
 }
 // ゲスト側がホストから受け取ったメッセージを種類別に処理する。
 function guestData(d) {
@@ -377,22 +448,25 @@ function guestData(d) {
     setActiveMap(d.mapIndex);
     scores = Array(matchPlayers).fill(0);
     round = 1;
-    S = null;
+    stateTarget = statePrevious = null;
     enterMatchScreen(() => {
-      showMapIntro();
-      requestGuestState();
+      connections[0]?.open && connections[0].send({ type: "ready" });
     });
     netStatus.textContent = "";
     startGuestControls();
   }
-  if (d.type === "countdown") showCountdown(d.value);
+  if (d.type === "roundStart") {
+    showMapIntro();
+    scheduleCountdown(d.startAt);
+  }
+  if (d.type === "countdownStart") scheduleCountdown(d.startAt);
   if (d.type === "state") {
-    clearInterval(guestSyncTimer);
-    guestSyncTimer = 0;
-    if (Number.isInteger(d.mapIndex) && d.mapIndex !== activeMapIndex) {
+    if (Number.isInteger(d.mapIndex) && d.mapIndex !== activeMapIndex)
       setActiveMap(d.mapIndex);
-    }
-    S = d.S;
+    statePrevious = stateTarget || d.S;
+    stateTarget = d.S;
+    stateReceivedAt = performance.now();
+    S = interpolateState(statePrevious, stateTarget, 0);
     elapsed = d.elapsed;
     round = d.round;
     scores = d.scores;
@@ -402,10 +476,39 @@ function guestData(d) {
       60 - Math.floor(elapsed),
     );
     renderScores();
-    draw();
+    if (!guestRenderRaf)
+      guestRenderRaf = requestAnimationFrame(guestRenderLoop);
   }
   if (d.type === "end") showResult(d.scores);
   if (d.type === "error") netStatus.textContent = d.message;
+}
+function interpolateState(from, to, alpha) {
+  if (!to) return from;
+  const result = structuredClone(to);
+  if (!from?.swimmers) return result;
+  result.swimmers.forEach((o, i) => {
+    const a = from.swimmers[i];
+    if (!a || a.secured !== o.secured) return;
+    // 自分は最新のホスト座標を即時表示し、相手だけを補間する。
+    if (mode === "local" && !isHost && i === myId) return;
+    o.x = a.x + (o.x - a.x) * alpha;
+    o.y = a.y + (o.y - a.y) * alpha;
+    o.facingX = a.facingX + (o.facingX - a.facingX) * alpha;
+    o.facingY = a.facingY + (o.facingY - a.facingY) * alpha;
+  });
+  return result;
+}
+function guestRenderLoop(now) {
+  if (mode !== "local" || isHost || localPhase !== "game") {
+    guestRenderRaf = 0;
+    return;
+  }
+  if (stateTarget) {
+    const alpha = Math.min(1, (now - stateReceivedAt) / INTERPOLATION_MS);
+    S = interpolateState(statePrevious, stateTarget, alpha);
+    draw();
+  }
+  guestRenderRaf = requestAnimationFrame(guestRenderLoop);
 }
 function getSettings() {
   return { limit: +playerLimit.value, fillCpu: fillCpu.checked };
@@ -454,11 +557,16 @@ function peerError(e) {
 }
 function closePeer() {
   stopAbilityTimer();
-  clearInterval(guestInputTimer);
-  clearInterval(guestSyncTimer);
-  guestInputTimer = guestSyncTimer = 0;
   connections.forEach((c) => c.close());
   connections = [];
+  clearInterval(guestInputTimer);
+  clearTimeout(guestDisconnectTimer);
+  clearTimeout(roundStartTimeout);
+  cancelAnimationFrame(guestRenderRaf);
+  guestRenderRaf = guestInputTimer = guestDisconnectTimer = 0;
+  disconnectTimers.forEach((timer) => clearTimeout(timer));
+  disconnectTimers.clear();
+  readyGuestIds.clear();
   if (peer) peer.destroy();
   peer = null;
   lobbyMembers = [];
@@ -503,6 +611,7 @@ function tryStartAfterAbilities() {
   lobbyMembers.forEach((m) => (matchKinds[m.id] = m.kind));
   selectRandomMap();
   localPhase = "game";
+  readyGuestIds.clear();
   connections.forEach(
     (c) => c.open && c.send({ type: "start", count: matchPlayers, mapIndex: activeMapIndex }),
   );
@@ -520,17 +629,7 @@ function startGuestControls() {
     });
     tackleQueued = false;
   };
-  guestInputTimer = setInterval(send, 50);
-}
-// 初期stateを受け取るまで、ホストへ再送を要求する。
-function requestGuestState() {
-  clearInterval(guestSyncTimer);
-  const request = () => {
-    if (S || !connections[0]?.open) return;
-    connections[0].send({ type: "readyForState" });
-  };
-  request();
-  guestSyncTimer = setInterval(request, 250);
+  guestInputTimer = setInterval(send, NETWORK_SEND_MS);
 }
 // =========================================================
 // 4. マップ判定・CPUの経路探索
@@ -571,6 +670,9 @@ function randomOpen(m = 90) {
     if (!blocked(p.x, p.y, 35)) return p;
   }
   return { x: WORLD_W / 2, y: WORLD_H / 2 };
+}
+function eggCountForPlayers(count) {
+  return ({ 2: 1, 3: 2, 4: 2, 5: 3, 6: 4 })[count] || 3;
 }
 function cpuCanSeeEgg(o, e) {
   return (
@@ -726,7 +828,7 @@ function make() {
     )
     .sort(() => Math.random() - 0.5);
   let eggs = spots
-    .slice(0, 3)
+    .slice(0, eggCountForPlayers(matchPlayers))
     .map((v) => ({
       x: v[0],
       y: v[1],
@@ -803,40 +905,66 @@ function sendCountdown(value) {
       (c) => c.open && c.send({ type: "countdown", value }),
     );
 }
-// PeerJSで確実に送れるよう、Setなどを含まない試合状態へ変換する。
-function makeNetworkState() {
-  if (!S) return null;
-  return {
-    swimmers: S.swimmers.map((o) => ({
-      ...o,
-      visitedRooms: Array.from(o.visitedRooms || []),
-    })),
-    eggs: S.eggs.map((e) => ({ ...e })),
-  };
+function scheduleCountdown(startAt) {
+  const id = ++countdownId;
+  [
+    { at: startAt - 3000, value: "3" },
+    { at: startAt - 2000, value: "2" },
+    { at: startAt - 1000, value: "1" },
+    { at: startAt, value: "START" },
+  ].forEach(({ at, value }) => {
+    setTimeout(() => {
+      if (id !== countdownId) return;
+      showCountdown(value);
+      if (value === "START" && isHost) {
+        last = performance.now();
+        raf = requestAnimationFrame(loop);
+      }
+    }, Math.max(0, at - Date.now()));
+  });
 }
-function createStateMessage() {
-  const networkState = makeNetworkState();
-  if (!networkState) return null;
+function networkState() {
+  if (!S) return null;
+  const safe = structuredClone(S);
+  safe.swimmers.forEach((o) => {
+    if (o.visitedRooms instanceof Set) o.visitedRooms = [...o.visitedRooms];
+  });
   return {
     type: "state",
-    S: networkState,
+    S: safe,
     elapsed,
     round,
-    scores: [...scores],
+    scores,
     mapIndex: activeMapIndex,
   };
 }
 function sendStateTo(connection) {
-  if (!connection?.open) return;
-  const message = createStateMessage();
-  if (message) connection.send(message);
+  const state = networkState();
+  if (state && connection?.open) connection.send(state);
 }
-function broadcastState() {
-  connections.forEach(sendStateTo);
+function tryBeginSynchronizedRound() {
+  if (
+    !isHost ||
+    localPhase !== "game" ||
+    !S ||
+    roundCountdownScheduled
+  )
+    return;
+  const expected = connections.filter((c) => c.open).map((c) => c.playerId);
+  if (expected.some((id) => !readyGuestIds.has(id))) return;
+  clearTimeout(roundStartTimeout);
+  roundCountdownScheduled = true;
+  const startAt = Date.now() + 5200;
+  connections.forEach(
+    (c) => c.open && c.send({ type: "roundStart", startAt }),
+  );
+  showMapIntro();
+  scheduleCountdown(startAt);
 }
 // ラウンドを初期化し「3→2→1→START」後にゲームループを開始。
 function newRound(showIntroFirst = false) {
   let id = ++countdownId;
+  roundCountdownScheduled = false;
   S = make();
   elapsed = 0;
   last = 0;
@@ -845,9 +973,8 @@ function newRound(showIntroFirst = false) {
   renderScores();
   cancelAnimationFrame(raf);
   draw();
-  if (mode === "local" && isHost) {
-    broadcastState();
-  }
+  if (mode === "local" && isHost)
+    connections.forEach((c) => sendStateTo(c));
   const beginCountdown = () => {
     if (id !== countdownId) return;
     sendCountdown("3");
@@ -860,11 +987,29 @@ function newRound(showIntroFirst = false) {
       raf = requestAnimationFrame(loop);
     }, 3000);
   };
-  if (showIntroFirst) showMapIntro(beginCountdown);
+  if (mode === "local" && isHost && showIntroFirst) {
+    roundStartTimeout = setTimeout(() => {
+      connections
+        .filter((c) => c.open && !readyGuestIds.has(c.playerId))
+        .forEach((c) => {
+          beginCpuTakeover(c.playerId);
+          c.close();
+        });
+      tryBeginSynchronizedRound();
+    }, READY_WAIT_MS);
+    tryBeginSynchronizedRound();
+  } else if (mode === "local" && isHost) {
+    const startAt = Date.now() + 3200;
+    connections.forEach(
+      (c) => c.open && c.send({ type: "countdownStart", startAt }),
+    );
+    scheduleCountdown(startAt);
+  } else if (showIntroFirst) showMapIntro(beginCountdown);
   else beginCountdown();
 }
 function playerLabel(i) {
   if (i === myId) return "YOU";
+  if (S?.swimmers[i]?.cpuTakeover) return `P${i + 1}（CPU代行）`;
   if (S?.swimmers[i]?.human) return "P" + (i + 1);
   return "CPU " + (i + 1);
 }
@@ -1210,9 +1355,9 @@ function loop(t) {
     }
   });
   draw();
-  if (mode === "local" && isHost && t - lastNetSend > 65) {
+  if (mode === "local" && isHost && t - lastNetSend > NETWORK_SEND_MS) {
     lastNetSend = t;
-    broadcastState();
+    connections.forEach((c) => sendStateTo(c));
   }
   if (S.eggs.every((e) => e.claimed) || elapsed > 60) {
     if (round < 3) {
