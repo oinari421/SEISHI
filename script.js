@@ -7,7 +7,7 @@ const K = [
     "chemo",
     "◉",
     "ケモタクシス型",
-    "卵子の1100px以内で光り始め、近づくほど強く発光する。",
+    "卵子の750px以内で光り始め、近づくほど強く発光する。",
   ],
   ["rheo", "≋", "レオタクシス型", "水流に逆らうと加速し、流されにくい。"],
   [
@@ -39,13 +39,14 @@ const MAP_SCALE = 0.92,
   TACKLE_SPEED = 500,
   MISS_STUN = 0.65,
   MATURITY_TIME = 35,
-  // 画面外の卵子にも段階的に反応できるよう、従来350pxから拡大。
-  CHEMO_RANGE = 1100;
+  // 画面に入る少し前から反応しつつ、常時発光しにくい距離に調整。
+  CHEMO_RANGE = 750;
 const MAP_COLORS = {
   outside: "#000000",
-  walkable: "#f2a0ac",
-  water: "#72cfe8",
-  slime: "#68c982",
+  // キャラクターと能力エフェクトが埋もれないよう、全体の明度を下げる。
+  walkable: "#9b5862",
+  water: "#347f98",
+  slime: "#39794d",
   wall: "#000000",
 };
 const scaleRect = (r) => ({
@@ -1884,10 +1885,12 @@ function draw() {
       nearestEggDistance = remaining.length
         ? Math.min(...remaining.map((e) => D(o, e)))
         : Infinity,
-      // 1100px地点で弱く光り始め、近づくほど連続的に強くなる。
+      // 750px地点で弱く光り始め、近づくほど連続的に強くなる。
       chemoGlow = o.kind === "chemo"
         ? C(1 - nearestEggDistance / CHEMO_RANGE, 0, 1)
-        : 0;
+        : 0,
+      // 遠距離の光を抑え、卵子へ近づいたときの変化を分かりやすくする。
+      chemoSignal = Math.pow(chemoGlow, 0.75);
     x.save();
     x.translate(o.x, o.y);
     x.rotate(Math.atan2(o.facingY, o.facingX));
@@ -1896,6 +1899,27 @@ function draw() {
       x.beginPath();
       x.ellipse(-5, 0, 36, 24, 0, 0, 7);
       x.fill();
+    }
+    if (chemoSignal > 0) {
+      // 距離に応じて太く明るくなり、軽く脈動する外周リング。
+      const pulse = 0.9 + Math.sin(elapsed * 5 + o.id) * 0.1;
+      x.save();
+      x.strokeStyle = `rgba(255, 224, 55, ${0.3 + chemoSignal * 0.7})`;
+      x.lineWidth = 2 + chemoSignal * 5;
+      x.shadowColor = "#ffe037";
+      x.shadowBlur = (18 + chemoSignal * 55) * pulse;
+      x.beginPath();
+      x.ellipse(
+        0,
+        0,
+        (26 + chemoSignal * 18) * pulse,
+        (20 + chemoSignal * 14) * pulse,
+        0,
+        0,
+        Math.PI * 2,
+      );
+      x.stroke();
+      x.restore();
     }
     x.strokeStyle = o.color;
     x.lineWidth = 7;
@@ -1912,8 +1936,8 @@ function draw() {
     );
     x.stroke();
     x.fillStyle = o.color;
-    x.shadowBlur = chemoGlow > 0 ? 8 + chemoGlow * 42 : 0;
-    x.shadowColor = `rgba(255, 243, 106, ${0.2 + chemoGlow * 0.8})`;
+    x.shadowBlur = chemoSignal > 0 ? 15 + chemoSignal * 55 : 0;
+    x.shadowColor = `rgba(255, 224, 55, ${0.25 + chemoSignal * 0.75})`;
     x.beginPath();
     x.ellipse(0, 0, 19, 14, 0, 0, 7);
     x.fill();
