@@ -206,6 +206,27 @@
         background: #ffd166;
         color: #102332;
       }
+      .match-info {
+        display: flex;
+        gap: 7px;
+        margin-left: auto;
+      }
+      .match-info span {
+        background: #0d2b3a;
+        border: 1px solid #5fcde755;
+        border-radius: 8px;
+        padding: 6px 9px;
+        font-size: 11px;
+        white-space: nowrap;
+      }
+      .spectator-controls {
+        display: none;
+        align-items: center;
+        gap: 8px;
+      }
+      .spectator-controls button {
+        padding: 8px 12px;
+      }
       .wrap {
         flex: 1;
         display: grid;
@@ -367,6 +388,15 @@
               空席をCPUで補充する</label
             >
           </div>
+          <div class="field">
+            <label>対戦マップ</label>
+            <select id="mapSelect" onchange="broadcastLobby()">
+              <option value="-1" selected>ランダム</option>
+              <option value="0">標準子宮</option>
+              <option value="1">迷路子宮</option>
+              <option value="2">激流子宮</option>
+            </select>
+          </div>
           <button class="primary" id="createRoomBtn" onclick="createRoom()">
             招待コードを発行
           </button>
@@ -391,6 +421,7 @@
             </div>
           </div>
           <div id="players" class="players"></div>
+          <p id="selectedMapText" class="status"></p>
           <button
             class="primary"
             id="hostStart"
@@ -409,6 +440,10 @@
       <header class="hud">
         <b>ROUND <span id="round">1</span><span id="roundTotal">/3</span></b>
         <div class="time" id="time">60</div>
+        <div class="match-info">
+          <span id="currentType">型：-</span>
+          <span id="remainingEggs">残り卵子：0</span>
+        </div>
         <div class="scores" id="scores"></div>
       </header>
       <div class="wrap">
@@ -418,6 +453,11 @@
       </div>
       <footer class="controls">
         <div class="help">移動 WASD / 矢印　タックル SPACE</div>
+        <div id="spectatorControls" class="spectator-controls">
+          <button class="secondary" onclick="changeSpectator(-1)">←</button>
+          <b id="spectatorLabel">観戦中</b>
+          <button class="secondary" onclick="changeSpectator(1)">→</button>
+        </div>
         <button class="dash" id="dash">
           TACKLE<br /><small id="tackleStatus">SPACE</small>
         </button>
@@ -432,6 +472,6 @@
     </section>
     <!-- PeerJS：招待コードを使った端末間通信に使用 -->
     <script src="vendor/peerjs/peerjs.min.js"></script>
-    <script src="script.js?v=chemo-range-balance-v12"></script>
+    <script src="script.js?v=match-ui-speed-spectate-v13"></script>
   </body>
 </html>

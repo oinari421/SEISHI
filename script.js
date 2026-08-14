@@ -212,6 +212,8 @@ let kind = "chemo",
   // 3ラウンド終了時の同点首位だけで行う決着戦。
   isDuel = false,
   duelPlayerIds = [],
+  // 卵子獲得後に観戦しているプレイヤーID。-1なら自動選択する。
+  spectateTargetId = -1,
   guestRenderRaf = 0,
   guestInputTimer = 0,
   guestDisconnectTimer = 0,
@@ -290,6 +292,7 @@ function returnToTitle() {
   S = null;
   isDuel = false;
   duelPlayerIds = [];
+  spectateTargetId = -1;
   mode = "solo";
   select.style.display = "none";
   lobby.style.display = "none";
@@ -580,6 +583,9 @@ function guestData(d) {
   }
   if (d.type === "lobby") {
     lobbyMembers = d.members;
+    if (d.settings) {
+      selectedMapText.textContent = `選択マップ：${mapSettingName(d.settings.mapIndex)}`;
+    }
     renderLobby();
   }
   if (d.type === "selectAbility") {
@@ -615,10 +621,12 @@ function guestData(d) {
     scheduleCountdown(d.startAt);
   }
   if (d.type === "countdownStart") scheduleCountdown(d.startAt);
+  if (d.type === "duelNotice") {
+    toastMsg(d.message || "同点首位のため決着戦へ移行します", 2800);
+  }
   if (d.type === "duel") {
     isDuel = true;
     duelPlayerIds = d.playerIds || [];
-    toastMsg("同点首位による一騎打ち！");
   }
   if (d.type === "state") {
     if (Number.isInteger(d.mapIndex) && d.mapIndex !== activeMapIndex)
@@ -645,6 +653,7 @@ function guestData(d) {
       60 - Math.floor(elapsed),
     );
     renderScores();
+    updateMatchInfo();
     // 補間ループを待たず、受信した最初の状態を必ず描画する。
     draw();
     if (!guestRenderRaf)
@@ -793,7 +802,14 @@ function guestRenderLoop(now) {
   guestRenderRaf = requestAnimationFrame(guestRenderLoop);
 }
 function getSettings() {
-  return { limit: +playerLimit.value, fillCpu: fillCpu.checked };
+  return {
+    limit: +playerLimit.value,
+    fillCpu: fillCpu.checked,
+    mapIndex: Number(mapSelect.value),
+  };
+}
+function mapSettingName(index) {
+  return Number(index) < 0 ? "ランダム" : (MAPS[Number(index)]?.name || "ランダム");
 }
 // 現在の参加者とルール設定を全ゲストへ共有する。
 function broadcastLobby() {
@@ -818,6 +834,7 @@ function renderLobby() {
     let n = +playerLimit.value - lobbyMembers.length;
     if (fillCpu.checked && n > 0)
       players.innerHTML += `<div class="playerrow"><span>CPU補充</span><b>${n}体</b></div>`;
+    selectedMapText.textContent = `選択マップ：${mapSettingName(Number(mapSelect.value))}`;
   }
 }
 async function copyInvite() {
@@ -895,7 +912,10 @@ function tryStartAfterAbilities() {
   if (!lobbyMembers.length || lobbyMembers.some((m) => !m.kind)) return;
   stopAbilityTimer();
   lobbyMembers.forEach((m) => (matchKinds[m.id] = m.kind));
-  selectRandomMap();
+  // ロビーで固定マップが選ばれていれば使用し、ランダム時だけ抽選する。
+  const selectedMapIndex = Number(mapSelect.value);
+  if (selectedMapIndex >= 0) setActiveMap(selectedMapIndex);
+  else selectRandomMap();
   localPhase = "game";
   startHostHeartbeat();
   readyGuestIds.clear();
@@ -1204,6 +1224,7 @@ function start() {
   round = 1;
   isDuel = false;
   duelPlayerIds = [];
+  spectateTargetId = -1;
   enterMatchScreen(() => newRound(true));
 }
 function showCountdown(value) {
@@ -1220,6 +1241,17 @@ function showCountdown(value) {
 function updateRoundHud() {
   document.getElementById("round").textContent = isDuel ? "決着戦" : round;
   document.getElementById("roundTotal").style.display = isDuel ? "none" : "";
+}
+function abilityName(kindId) {
+  return K.find((entry) => entry[0] === kindId)?.[2] || "未選択";
+}
+// 選択中の型と、まだ獲得されていない卵子数をHUDへ表示する。
+function updateMatchInfo() {
+  const me = S?.swimmers?.[myId];
+  currentType.textContent = `型：${abilityName(me?.kind || kind)}`;
+  const remaining = S?.eggs?.filter((egg) => !egg.claimed).length || 0;
+  remainingEggs.textContent = `残り卵子：${remaining}`;
+  updateSpectatorControls();
 }
 function sendCountdown(value) {
   showCountdown(value);
@@ -1298,6 +1330,7 @@ function newRound(showIntroFirst = false) {
   updateRoundHud();
   document.getElementById("time").textContent = "60";
   renderScores();
+  updateMatchInfo();
   cancelAnimationFrame(raf);
   draw();
   if (mode === "local" && isHost)
@@ -1348,12 +1381,16 @@ function renderScores() {
     )
     .join("");
 }
-function toastMsg(s) {
+function toastMsg(s, duration = 800) {
   clearTimeout(uiToastTimeout);
   toast.textContent = s;
   toast.style.fontSize = "";
+  toast.style.whiteSpace = "pre-line";
   toast.style.display = "block";
-  uiToastTimeout = setTimeout(() => (toast.style.display = "none"), 800);
+  uiToastTimeout = setTimeout(() => {
+    toast.style.display = "none";
+    toast.style.whiteSpace = "";
+  }, duration);
 }
 
 // 3ラウンド終了時に最高得点者が複数なら、該当者だけの決着戦へ移る。
@@ -1367,13 +1404,24 @@ function beginDuel() {
     end();
     return;
   }
-  isDuel = true;
-  toastMsg("同点首位による一騎打ち！");
+  // 全端末で同じ人物名に見えるよう、YOUではなくP番号で告知する。
+  const names = duelPlayerIds.map((id) => `P${id + 1}`);
+  const message = `${names.join(" と ")}が同点のため\n決着戦へ移行します`;
+  toastMsg(message, 2800);
   if (mode === "local" && isHost)
     connections.forEach(
-      (c) => c.open && c.send({ type: "duel", playerIds: duelPlayerIds }),
+      (c) => c.open && c.send({ type: "duelNotice", message }),
     );
-  setTimeout(() => newRound(false), 1200);
+  // 告知を読み終えてから決着戦状態を同期し、1個の卵子で開始する。
+  setTimeout(() => {
+    isDuel = true;
+    spectateTargetId = -1;
+    if (mode === "local" && isHost)
+      connections.forEach(
+        (c) => c.open && c.send({ type: "duel", playerIds: duelPlayerIds }),
+      );
+    newRound(false);
+  }, 3000);
 }
 // =========================================================
 // 7. プレイヤー入力・タックル
@@ -1408,13 +1456,14 @@ function tackleCooldown(o) {
 }
 function moveSpeed(o) {
   if (o.human) {
-    if (o.kind === "hyper") return 155;
-    if (o.kind === "capac") return isMature(o) ? 176 : 150;
-    return 160;
+    // 旧版の水流加速中に近い速度を通常値とし、全体のテンポを上げる。
+    if (o.kind === "hyper") return 210;
+    if (o.kind === "capac") return isMature(o) ? 235 : 205;
+    return 220;
   }
-  if (o.kind === "hyper") return 145;
-  if (o.kind === "capac") return isMature(o) ? 165 : 140;
-  return 150;
+  if (o.kind === "hyper") return 200;
+  if (o.kind === "capac") return isMature(o) ? 225 : 195;
+  return 210;
 }
 function zoneAt(zones, o) {
   return zones.find((z) => o.x >= z.x && o.x <= z.x + z.w && o.y >= z.y && o.y <= z.y + z.h);
@@ -1701,6 +1750,7 @@ function loop(t) {
       let n = S.eggs.filter((x) => x.claimed).length;
       scores[o.id] += n === 1 ? 3 : n === 2 ? 2 : 1;
       renderScores();
+      updateMatchInfo();
       toastMsg(o.human ? "プレイヤーが獲得" : "CPUが獲得");
     }
   });
@@ -1812,10 +1862,8 @@ function buildWalkablePath(ctx) {
 }
 function draw() {
   let x = cv.getContext("2d"),
-    // 決着戦の非参加者は、先頭の決着戦参加者を自動で観戦する。
-    p = isDuel && S.swimmers[myId]?.secured
-      ? S.swimmers.find((o) => !o.secured) || S.swimmers[0]
-      : S.swimmers[myId] || S.swimmers[0],
+    // 卵子獲得後は、選択した未獲得プレイヤーを追従して観戦する。
+    p = getCameraPlayer(),
     camX = C(p.x - VIEW_W / 2, 0, WORLD_W - VIEW_W),
     camY = C(p.y - VIEW_H / 2, 0, WORLD_H - VIEW_H);
   // 通行範囲外は完全な黒。グラデーションと通路の発光は使用しない。
@@ -1957,6 +2005,41 @@ function draw() {
   });
   x.restore();
   drawMinimap(x, camX, camY);
+}
+// 観戦対象候補は、まだ卵子を獲得していないプレイヤーだけに限定する。
+function activeSpectatorTargets() {
+  return (S?.swimmers || []).filter((player) => !player.secured);
+}
+function getCameraPlayer() {
+  const me = S?.swimmers?.[myId];
+  if (!me?.secured) return me || S?.swimmers?.[0];
+  const targets = activeSpectatorTargets();
+  if (!targets.length) return me || S.swimmers[0];
+  let target = targets.find((player) => player.id === spectateTargetId);
+  if (!target) {
+    target = targets[0];
+    spectateTargetId = target.id;
+  }
+  return target;
+}
+function changeSpectator(direction) {
+  const targets = activeSpectatorTargets();
+  if (!targets.length) return;
+  let index = targets.findIndex((player) => player.id === spectateTargetId);
+  index = (index + direction + targets.length) % targets.length;
+  spectateTargetId = targets[index].id;
+  updateSpectatorControls();
+  draw();
+}
+function updateSpectatorControls() {
+  const me = S?.swimmers?.[myId];
+  const targets = activeSpectatorTargets();
+  const observing = !!me?.secured && targets.length > 0;
+  spectatorControls.style.display = observing ? "flex" : "none";
+  dash.style.display = observing ? "none" : "block";
+  if (!observing) return;
+  const target = getCameraPlayer();
+  spectatorLabel.textContent = `${playerLabel(target.id)}を観戦中`;
 }
 // 右上のミニマップと、現在カメラが映している範囲を描画する。
 function drawMinimap(x, camX, camY) {
