@@ -7,7 +7,7 @@ const K = [
     "chemo",
     "◉",
     "ケモタクシス型",
-    "卵子の350px以内で発光。反応は全員から見える。",
+    "卵子の1100px以内で光り始め、近づくほど強く発光する。",
   ],
   ["rheo", "≋", "レオタクシス型", "水流に逆らうと加速し、流されにくい。"],
   [
@@ -39,7 +39,15 @@ const MAP_SCALE = 0.92,
   TACKLE_SPEED = 500,
   MISS_STUN = 0.65,
   MATURITY_TIME = 35,
-  CHEMO_RANGE = 350;
+  // 画面外の卵子にも段階的に反応できるよう、従来350pxから拡大。
+  CHEMO_RANGE = 1100;
+const MAP_COLORS = {
+  outside: "#000000",
+  walkable: "#f2a0ac",
+  water: "#72cfe8",
+  slime: "#68c982",
+  wall: "#000000",
+};
 const scaleRect = (r) => ({
   x: M(r.x), y: M(r.y), w: M(r.w), h: M(r.h),
   dx: r.dx || 0, dy: r.dy || 0, strength: r.strength || 0,
@@ -200,6 +208,9 @@ let kind = "chemo",
   abilityTimeoutId = 0,
   abilityDeadline = 0,
   matchKinds = [],
+  // 3ラウンド終了時の同点首位だけで行う決着戦。
+  isDuel = false,
+  duelPlayerIds = [],
   guestRenderRaf = 0,
   guestInputTimer = 0,
   guestDisconnectTimer = 0,
@@ -265,6 +276,27 @@ function beginMode(m) {
       joinRoom();
     }
   }
+}
+
+// モード選択後の各画面から通信・タイマーを停止してタイトルへ戻る。
+function returnToTitle() {
+  countdownId++;
+  cancelAnimationFrame(raf);
+  cancelAnimationFrame(guestRenderRaf);
+  clearTimeout(uiToastTimeout);
+  closePeer();
+  keys = {};
+  S = null;
+  isDuel = false;
+  duelPlayerIds = [];
+  mode = "solo";
+  select.style.display = "none";
+  lobby.style.display = "none";
+  game.style.display = "none";
+  result.style.display = "none";
+  mapIntro.classList.remove("show");
+  toast.style.display = "none";
+  title.style.display = "flex";
 }
 function openAbilitySelect(titleText = "能力を選ぶ") {
   selectTitle.textContent = titleText;
@@ -563,6 +595,8 @@ function guestData(d) {
     setActiveMap(d.mapIndex);
     scores = Array(matchPlayers).fill(0);
     round = 1;
+    isDuel = false;
+    duelPlayerIds = [];
     stateTarget = statePrevious = null;
     guestSelfPrediction = null;
     guestPredictedTackleQueued = false;
@@ -580,6 +614,11 @@ function guestData(d) {
     scheduleCountdown(d.startAt);
   }
   if (d.type === "countdownStart") scheduleCountdown(d.startAt);
+  if (d.type === "duel") {
+    isDuel = true;
+    duelPlayerIds = d.playerIds || [];
+    toastMsg("同点首位による一騎打ち！");
+  }
   if (d.type === "state") {
     if (Number.isInteger(d.mapIndex) && d.mapIndex !== activeMapIndex)
       setActiveMap(d.mapIndex);
@@ -597,7 +636,9 @@ function guestData(d) {
     elapsed = d.elapsed;
     round = d.round;
     scores = d.scores;
-    document.getElementById("round").textContent = round;
+    isDuel = !!d.isDuel;
+    duelPlayerIds = d.duelPlayerIds || [];
+    updateRoundHud();
     document.getElementById("time").textContent = Math.max(
       0,
       60 - Math.floor(elapsed),
@@ -1067,10 +1108,28 @@ function make() {
       staggerHold: 0,
     };
   });
-  swimmers.filter((o) => !o.human).forEach(nextRoomTarget);
+  if (isDuel) {
+    // 決着戦では同点首位以外を観戦状態にし、首位だけを開始地点へ再配置する。
+    swimmers.forEach((o) => {
+      if (!duelPlayerIds.includes(o.id)) {
+        o.secured = true;
+        return;
+      }
+      const duelIndex = duelPlayerIds.indexOf(o.id);
+      const angle = -Math.PI / 2 +
+        (duelIndex * Math.PI * 2) / duelPlayerIds.length;
+      o.x = cx + Math.cos(angle) * 82;
+      o.y = cy + Math.sin(angle) * 82;
+      o.facingX = Math.cos(angle);
+      o.facingY = Math.sin(angle);
+    });
+  }
+  swimmers
+    .filter((o) => !o.human && !o.secured)
+    .forEach(nextRoomTarget);
   // 卵子数と同じ数だけ離れた区画を選び、各区画から1地点だけ抽選する。
   // これにより、複数の卵子が同じ通路や部屋へ固まることを防ぐ。
-  const eggCount = eggCountForPlayers(matchPlayers);
+  const eggCount = isDuel ? 1 : eggCountForPlayers(matchPlayers);
   const selectedZones = [...activeMap.eggZones]
     .sort(() => Math.random() - 0.5)
     .slice(0, eggCount);
@@ -1142,6 +1201,8 @@ function start() {
   if (activeMapIndex < 0 || mode === "solo") selectRandomMap();
   scores = Array(matchPlayers).fill(0);
   round = 1;
+  isDuel = false;
+  duelPlayerIds = [];
   enterMatchScreen(() => newRound(true));
 }
 function showCountdown(value) {
@@ -1154,6 +1215,10 @@ function showCountdown(value) {
       toast.style.display = "none";
       toast.style.fontSize = "";
     }, 650);
+}
+function updateRoundHud() {
+  document.getElementById("round").textContent = isDuel ? "決着戦" : round;
+  document.getElementById("roundTotal").style.display = isDuel ? "none" : "";
 }
 function sendCountdown(value) {
   showCountdown(value);
@@ -1190,6 +1255,8 @@ function networkState() {
     round,
     scores,
     mapIndex: activeMapIndex,
+    isDuel,
+    duelPlayerIds: [...duelPlayerIds],
   };
 }
 function sendStateTo(connection) {
@@ -1227,7 +1294,7 @@ function newRound(showIntroFirst = false) {
   S = make();
   elapsed = 0;
   last = 0;
-  document.getElementById("round").textContent = round;
+  updateRoundHud();
   document.getElementById("time").textContent = "60";
   renderScores();
   cancelAnimationFrame(raf);
@@ -1286,6 +1353,26 @@ function toastMsg(s) {
   toast.style.fontSize = "";
   toast.style.display = "block";
   uiToastTimeout = setTimeout(() => (toast.style.display = "none"), 800);
+}
+
+// 3ラウンド終了時に最高得点者が複数なら、該当者だけの決着戦へ移る。
+function beginDuel() {
+  const topScore = Math.max(...scores);
+  duelPlayerIds = scores
+    .map((score, id) => ({ score, id }))
+    .filter((entry) => entry.score === topScore)
+    .map((entry) => entry.id);
+  if (duelPlayerIds.length < 2) {
+    end();
+    return;
+  }
+  isDuel = true;
+  toastMsg("同点首位による一騎打ち！");
+  if (mode === "local" && isHost)
+    connections.forEach(
+      (c) => c.open && c.send({ type: "duel", playerIds: duelPlayerIds }),
+    );
+  setTimeout(() => newRound(false), 1200);
 }
 // =========================================================
 // 7. プレイヤー入力・タックル
@@ -1622,10 +1709,19 @@ function loop(t) {
     connections.forEach((c) => sendStateTo(c));
   }
   if (S.eggs.every((e) => e.claimed) || elapsed > 60) {
-    if (round < 3) {
+    if (isDuel) {
+      // 卵子を取った時点で決着。時間切れなら同じ首位メンバーで再戦する。
+      if (S.eggs.every((e) => e.claimed)) setTimeout(end, 600);
+      else setTimeout(() => newRound(false), 600);
+    } else if (round < 3) {
       round++;
       setTimeout(newRound, 600);
-    } else setTimeout(end, 600);
+    } else {
+      const topScore = Math.max(...scores);
+      const leaders = scores.filter((score) => score === topScore).length;
+      if (leaders > 1) setTimeout(beginDuel, 600);
+      else setTimeout(end, 600);
+    }
     return;
   }
   raf = requestAnimationFrame(loop);
@@ -1678,9 +1774,27 @@ function capsulePath(ctx, a, b, radius) {
   let angle = Math.atan2(b.y - a.y, b.x - a.x), nx = Math.cos(angle + Math.PI / 2) * radius, ny = Math.sin(angle + Math.PI / 2) * radius;
   ctx.moveTo(a.x + nx, a.y + ny);
   ctx.lineTo(b.x + nx, b.y + ny);
-  ctx.arc(b.x, b.y, radius, angle + Math.PI / 2, angle - Math.PI / 2);
+  // 終点側は時計回りの短い半円を描く。
+  // trueがないと270度の長い円弧になり、通路同士の間に黒い切れ込みが生じる。
+  ctx.arc(
+    b.x,
+    b.y,
+    radius,
+    angle + Math.PI / 2,
+    angle - Math.PI / 2,
+    true,
+  );
   ctx.lineTo(a.x - nx, a.y - ny);
-  ctx.arc(a.x, a.y, radius, angle - Math.PI / 2, angle + Math.PI / 2);
+  // 開始点側も時計回りにして、通路の外側へ膨らむ半円にする。
+  // falseのままだと通路の内側を通って自己交差し、大きな黒い穴になる。
+  ctx.arc(
+    a.x,
+    a.y,
+    radius,
+    angle - Math.PI / 2,
+    angle + Math.PI / 2,
+    true,
+  );
   ctx.closePath();
 }
 function buildWalkablePath(ctx) {
@@ -1697,48 +1811,32 @@ function buildWalkablePath(ctx) {
 }
 function draw() {
   let x = cv.getContext("2d"),
-    p = S.swimmers[myId] || S.swimmers[0],
+    // 決着戦の非参加者は、先頭の決着戦参加者を自動で観戦する。
+    p = isDuel && S.swimmers[myId]?.secured
+      ? S.swimmers.find((o) => !o.secured) || S.swimmers[0]
+      : S.swimmers[myId] || S.swimmers[0],
     camX = C(p.x - VIEW_W / 2, 0, WORLD_W - VIEW_W),
-    camY = C(p.y - VIEW_H / 2, 0, WORLD_H - VIEW_H),
-    g = x.createLinearGradient(0, 0, VIEW_W, VIEW_H);
-  g.addColorStop(0, "#183e54");
-  g.addColorStop(1, "#082131");
-  x.fillStyle = g;
+    camY = C(p.y - VIEW_H / 2, 0, WORLD_H - VIEW_H);
+  // 通行範囲外は完全な黒。グラデーションと通路の発光は使用しない。
+  x.fillStyle = MAP_COLORS.outside;
   x.fillRect(0, 0, VIEW_W, VIEW_H);
   x.save();
   x.translate(-camX, -camY);
   buildWalkablePath(x);
-  x.fillStyle = "#7d334a";
-  x.shadowColor = "#ff8cab66";
-  x.shadowBlur = 24;
+  x.fillStyle = MAP_COLORS.walkable;
   x.fill();
-  x.shadowBlur = 0;
   x.save();
   buildWalkablePath(x);
   x.clip();
   activeMap.water.forEach((z) => {
-    x.fillStyle = "#50c7dd20";
+    x.fillStyle = MAP_COLORS.water;
     x.fillRect(z.x, z.y, z.w, z.h);
-    x.fillStyle = "#d9f8ff99";
-    x.font = "14px sans-serif";
-    x.textAlign = "center";
-    x.fillText("水流", z.x + z.w / 2, z.y + z.h / 2);
   });
   activeMap.slime.forEach((z) => {
-    x.fillStyle = "#9ae8c020";
+    x.fillStyle = MAP_COLORS.slime;
     x.fillRect(z.x, z.y, z.w, z.h);
-    x.fillStyle = "#c8ffe5aa";
-    x.font = "14px sans-serif";
-    x.textAlign = "center";
-    x.fillText("頸管粘液", z.x + z.w / 2, z.y + z.h / 2);
   });
   x.restore();
-  x.fillStyle = "#f9c4d255";
-  x.font = "bold 17px sans-serif";
-  x.textAlign = "center";
-  x.fillText("子宮腔", WORLD_W / 2, M(170));
-  x.fillText("子宮頸部", WORLD_W / 2, M(1080));
-  x.fillText("膣内", WORLD_W / 2, M(1780));
   x.strokeStyle = "#ffd16635";
   x.setLineDash([12, 12]);
   x.beginPath();
@@ -1753,11 +1851,8 @@ function draw() {
     activeMap.start[1] - START_SAFE_RADIUS + 24,
   );
   WALLS.forEach((w) => {
-    x.fillStyle = "#4b162a";
+    x.fillStyle = MAP_COLORS.wall;
     x.fillRect(w.x, w.y, w.w, w.h);
-    x.strokeStyle = "#e888a799";
-    x.lineWidth = 3;
-    x.strokeRect(w.x, w.y, w.w, w.h);
   });
   S.eggs.forEach((e) => {
     if (e.claimed) return;
@@ -1786,10 +1881,13 @@ function draw() {
   S.swimmers.forEach((o) => {
     if (o.secured) return;
     let remaining = S.eggs.filter((e) => !e.claimed),
-      glow =
-        o.kind === "chemo" &&
-        remaining.length &&
-        Math.min(...remaining.map((e) => D(o, e))) < CHEMO_RANGE;
+      nearestEggDistance = remaining.length
+        ? Math.min(...remaining.map((e) => D(o, e)))
+        : Infinity,
+      // 1100px地点で弱く光り始め、近づくほど連続的に強くなる。
+      chemoGlow = o.kind === "chemo"
+        ? C(1 - nearestEggDistance / CHEMO_RANGE, 0, 1)
+        : 0;
     x.save();
     x.translate(o.x, o.y);
     x.rotate(Math.atan2(o.facingY, o.facingX));
@@ -1814,8 +1912,8 @@ function draw() {
     );
     x.stroke();
     x.fillStyle = o.color;
-    x.shadowBlur = glow ? 25 : 0;
-    x.shadowColor = "#fff36a";
+    x.shadowBlur = chemoGlow > 0 ? 8 + chemoGlow * 42 : 0;
+    x.shadowColor = `rgba(255, 243, 106, ${0.2 + chemoGlow * 0.8})`;
     x.beginPath();
     x.ellipse(0, 0, 19, 14, 0, 0, 7);
     x.fill();
@@ -1845,14 +1943,14 @@ function drawMinimap(x, camX, camY) {
     sx = mw / WORLD_W,
     sy = mh / WORLD_H;
   x.save();
-  x.fillStyle = "#041521e8";
+  x.fillStyle = MAP_COLORS.outside;
   x.strokeStyle = "#a8e6f2";
   x.lineWidth = 2;
   x.fillRect(mx, my, mw, mh);
   x.strokeRect(mx, my, mw, mh);
-  x.fillStyle = "#7d334a";
+  x.fillStyle = MAP_COLORS.walkable;
   activeMap.paths.forEach((p) => {
-    x.strokeStyle = "#7d334a";
+    x.strokeStyle = MAP_COLORS.walkable;
     x.lineWidth = Math.max(2, p.width * sx);
     x.lineCap = "round";
     x.beginPath();
@@ -1864,11 +1962,16 @@ function drawMinimap(x, camX, camY) {
     x.ellipse(mx + e.x * sx, my + e.y * sy, e.rx * sx, e.ry * sy, 0, 0, Math.PI * 2);
     x.fill();
   });
-  x.fillStyle = "#50c7dd24";
+  // 水流と粘液をミニマップの通行範囲内だけに表示する。
+  x.save();
+  buildMinimapWalkablePath(x, mx, my, sx, sy);
+  x.clip();
+  x.fillStyle = MAP_COLORS.water;
   activeMap.water.forEach((z) => x.fillRect(mx + z.x * sx, my + z.y * sy, z.w * sx, z.h * sy));
-  x.fillStyle = "#9ae8c024";
+  x.fillStyle = MAP_COLORS.slime;
   activeMap.slime.forEach((z) => x.fillRect(mx + z.x * sx, my + z.y * sy, z.w * sx, z.h * sy));
-  x.fillStyle = "#5dbace99";
+  x.restore();
+  x.fillStyle = MAP_COLORS.wall;
   WALLS.forEach((w) =>
     x.fillRect(
       mx + w.x * sx,
@@ -1897,6 +2000,37 @@ function drawMinimap(x, camX, camY) {
   x.textAlign = "left";
   x.fillText("MAP", mx + 7, my + 13);
   x.restore();
+}
+
+// メイン画面と同じ通行可能形状をミニマップ座標で組み立てる。
+function buildMinimapWalkablePath(ctx, mx, my, sx, sy) {
+  ctx.beginPath();
+  activeMap.ellipses.forEach((e) => {
+    ctx.moveTo(mx + (e.x + e.rx) * sx, my + e.y * sy);
+    ctx.ellipse(
+      mx + e.x * sx,
+      my + e.y * sy,
+      e.rx * sx,
+      e.ry * sy,
+      0,
+      0,
+      Math.PI * 2,
+    );
+  });
+  activeMap.paths.forEach((p) =>
+    p.points.forEach((point, i) => {
+      if (!i) return;
+      capsulePath(
+        ctx,
+        {
+          x: mx + p.points[i - 1].x * sx,
+          y: my + p.points[i - 1].y * sy,
+        },
+        { x: mx + point.x * sx, y: my + point.y * sy },
+        (p.width * sx) / 2,
+      );
+    }),
+  );
 }
 // =========================================================
 // 10. 試合終了・再戦

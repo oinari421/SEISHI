@@ -330,6 +330,7 @@
       <br /><button class="primary" id="typeConfirm" onclick="afterType()">
         このタイプで決定 →
       </button>
+      <button class="secondary" onclick="returnToTitle()">タイトルへ戻る</button>
       <p id="selectStatus" class="status"></p>
     </section>
     <!-- ローカル対戦ロビー：部屋作成、招待コード参加、人数設定 -->
@@ -401,11 +402,12 @@
         </div>
         <p id="netStatus" class="status"></p>
       </div>
+      <button class="secondary" onclick="returnToTitle()">タイトルへ戻る</button>
     </section>
     <!-- ゲーム本編：HUD、Canvas、タックル操作 -->
     <section id="game" class="game">
       <header class="hud">
-        <b>ROUND <span id="round">1</span>/3</b>
+        <b>ROUND <span id="round">1</span><span id="roundTotal">/3</span></b>
         <div class="time" id="time">60</div>
         <div class="scores" id="scores"></div>
       </header>
@@ -430,6 +432,6 @@
     </section>
     <!-- PeerJS：招待コードを使った端末間通信に使用 -->
     <script src="vendor/peerjs/peerjs.min.js"></script>
-    <script src="script.js?v=three-map-redesign-v7"></script>
+    <script src="script.js?v=capsule-both-ends-fix-v10"></script>
   </body>
 </html>
