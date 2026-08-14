@@ -162,6 +162,13 @@ let kind = "chemo",
   guestRenderRaf = 0,
   guestInputTimer = 0,
   guestDisconnectTimer = 0,
+  hostWatchdogTimer = 0,
+  hostHeartbeatTimer = 0,
+  lastHostMessageAt = 0,
+  hostDisconnecting = false,
+  uiToastTimeout = 0,
+  guestRenderLast = 0,
+  guestSelfPrediction = null,
   stateTarget = null,
   statePrevious = null,
   stateReceivedAt = 0,
@@ -169,8 +176,18 @@ let kind = "chemo",
   roundStartTimeout = 0,
   roundCountdownScheduled = false,
   disconnectTimers = new Map();
-const NETWORK_SEND_MS = 40,
-  INTERPOLATION_MS = 90,
+// =========================================================
+// 通信調整値
+// 状態は約30fps。送信待ちが溜まった場合は古い状態を捨てる。
+// =========================================================
+const NETWORK_SEND_MS = 33,
+  MAX_BUFFERED_BYTES = 64 * 1024,
+  // 相手を先読みする最大時間。大きすぎると壁抜けして見えるため100msまで。
+  REMOTE_PREDICTION_MS = 100,
+  // 表示座標が予測位置へ近づく割合。1にすると再びカクつきやすい。
+  REMOTE_SMOOTHING = 0.38,
+  // ホストからこの時間データが届かなければ、切断確認へ移る。
+  HOST_SILENCE_MS = 2500,
   DISCONNECT_GRACE_MS = 10000,
   READY_WAIT_MS = 5000;
 // キャラクター選択ボタンをKの設定から自動生成する。
@@ -406,16 +423,28 @@ function joinRoom() {
   });
   peer.on("error", peerError);
 }
+// =========================================================
+// ホスト切断監視
+// closeイベントに加え、状態データが止まった場合も検知する。
+// =========================================================
 function handleHostDisconnect() {
   if (localPhase !== "game") {
     netStatus.textContent = "ホストとの接続が切れました";
     return;
   }
-  toastMsg("ホストとの接続が切れました。10秒間待機します");
+  if (hostDisconnecting) return;
+  hostDisconnecting = true;
+  cancelAnimationFrame(guestRenderRaf);
+  guestRenderRaf = 0;
+  clearInterval(guestInputTimer);
+  clearInterval(hostWatchdogTimer);
+  showPersistentToast("ホストとの接続が切れました\n10秒後にロビーへ戻ります");
   clearTimeout(guestDisconnectTimer);
   guestDisconnectTimer = setTimeout(() => {
     cancelAnimationFrame(guestRenderRaf);
     clearInterval(guestInputTimer);
+    clearInterval(hostWatchdogTimer);
+    hidePersistentToast();
     localPhase = "lobby";
     game.style.display = "none";
     lobby.style.display = "flex";
@@ -425,8 +454,44 @@ function handleHostDisconnect() {
       "ホストが切断したため試合を中断しました。部屋へ入り直してください。";
   }, DISCONNECT_GRACE_MS);
 }
+function startHostWatchdog() {
+  clearInterval(hostWatchdogTimer);
+  lastHostMessageAt = Date.now();
+  hostWatchdogTimer = setInterval(() => {
+    if (
+      localPhase === "game" &&
+      !hostDisconnecting &&
+      Date.now() - lastHostMessageAt > HOST_SILENCE_MS
+    )
+      handleHostDisconnect();
+  }, 500);
+}
+function startHostHeartbeat() {
+  clearInterval(hostHeartbeatTimer);
+  hostHeartbeatTimer = setInterval(() => {
+    if (!isHost || localPhase !== "game") return;
+    connections.forEach(
+      (connection) => connection.open && connection.send({ type: "heartbeat" }),
+    );
+  }, 500);
+}
+function showPersistentToast(message) {
+  clearTimeout(uiToastTimeout);
+  toast.textContent = message;
+  toast.style.whiteSpace = "pre-line";
+  toast.style.display = "block";
+  toast.style.fontSize = "24px";
+}
+function hidePersistentToast() {
+  clearTimeout(uiToastTimeout);
+  toast.style.display = "none";
+  toast.style.whiteSpace = "";
+  toast.style.fontSize = "";
+}
 // ゲスト側がホストから受け取ったメッセージを種類別に処理する。
 function guestData(d) {
+  // メッセージが1つでも届けばホストは生存中と判断する。
+  lastHostMessageAt = Date.now();
   if (d.type === "welcome") {
     myId = d.id;
     inviteArea.style.display = "block";
@@ -444,16 +509,22 @@ function guestData(d) {
   }
   if (d.type === "start") {
     stopAbilityTimer();
+    // 切断処理が正しく試合中判定になるよう、必ずgameへ変更する。
+    localPhase = "game";
+    hostDisconnecting = false;
     matchPlayers = d.count;
     setActiveMap(d.mapIndex);
     scores = Array(matchPlayers).fill(0);
     round = 1;
     stateTarget = statePrevious = null;
+    guestSelfPrediction = null;
+    guestRenderLast = 0;
     enterMatchScreen(() => {
       connections[0]?.open && connections[0].send({ type: "ready" });
     });
     netStatus.textContent = "";
     startGuestControls();
+    startHostWatchdog();
   }
   if (d.type === "roundStart") {
     showMapIntro();
@@ -466,7 +537,9 @@ function guestData(d) {
     statePrevious = stateTarget || d.S;
     stateTarget = d.S;
     stateReceivedAt = performance.now();
-    S = interpolateState(statePrevious, stateTarget, 0);
+    if (!guestSelfPrediction && d.S.swimmers?.[myId])
+      guestSelfPrediction = { ...d.S.swimmers[myId] };
+    S = buildGuestDisplayState(stateReceivedAt, 0);
     elapsed = d.elapsed;
     round = d.round;
     scores = d.scores;
@@ -481,24 +554,15 @@ function guestData(d) {
     if (!guestRenderRaf)
       guestRenderRaf = requestAnimationFrame(guestRenderLoop);
   }
-  if (d.type === "end") showResult(d.scores);
+  if (d.type === "end") {
+    localPhase = "result";
+    clearInterval(hostWatchdogTimer);
+    clearInterval(guestInputTimer);
+    cancelAnimationFrame(guestRenderRaf);
+    guestRenderRaf = 0;
+    showResult(d.scores);
+  }
   if (d.type === "error") netStatus.textContent = d.message;
-}
-function interpolateState(from, to, alpha) {
-  if (!to) return from;
-  const result = cloneGameState(to);
-  if (!from?.swimmers) return result;
-  result.swimmers.forEach((o, i) => {
-    const a = from.swimmers[i];
-    if (!a || a.secured !== o.secured) return;
-    // 自分は最新のホスト座標を即時表示し、相手だけを補間する。
-    if (mode === "local" && !isHost && i === myId) return;
-    o.x = a.x + (o.x - a.x) * alpha;
-    o.y = a.y + (o.y - a.y) * alpha;
-    o.facingX = a.facingX + (o.facingX - a.facingX) * alpha;
-    o.facingY = a.facingY + (o.facingY - a.facingY) * alpha;
-  });
-  return result;
 }
 function cloneGameState(source) {
   if (!source) return source;
@@ -515,14 +579,93 @@ function cloneGameState(source) {
     eggs: (source.eggs || []).map((e) => ({ ...e })),
   };
 }
+
+// =========================================================
+// ゲスト側の表示予測
+// 判定は一切変更せず、見た目だけを先に動かして通信遅延を隠す。
+// =========================================================
+function buildGuestDisplayState(now, dt) {
+  if (!stateTarget) return S;
+  const result = cloneGameState(stateTarget);
+  const previousDisplay = S;
+  const age = Math.min(REMOTE_PREDICTION_MS, now - stateReceivedAt) / 1000;
+
+  result.swimmers.forEach((o, i) => {
+    if (o.secured) return;
+
+    if (i === myId) {
+      updateGuestSelfPrediction(o, dt);
+      Object.assign(o, {
+        x: guestSelfPrediction.x,
+        y: guestSelfPrediction.y,
+        facingX: guestSelfPrediction.facingX,
+        facingY: guestSelfPrediction.facingY,
+      });
+      return;
+    }
+
+    // 相手は最新の速度から最大100ms先の座標を予測する。
+    const predictedX = o.x + (o.vx || 0) * age;
+    const predictedY = o.y + (o.vy || 0) * age;
+    const old = previousDisplay?.swimmers?.[i];
+    if (!old || Math.hypot(old.x - predictedX, old.y - predictedY) > 180) {
+      o.x = predictedX;
+      o.y = predictedY;
+    } else {
+      o.x = old.x + (predictedX - old.x) * REMOTE_SMOOTHING;
+      o.y = old.y + (predictedY - old.y) * REMOTE_SMOOTHING;
+    }
+  });
+  return result;
+}
+
+// 自分のキャラクターはキー入力をその場で見た目へ反映する。
+// ホストの確定座標との差は毎フレーム少しずつ戻し、大幅な差だけ即補正する。
+function updateGuestSelfPrediction(authoritative, dt) {
+  if (!guestSelfPrediction)
+    guestSelfPrediction = { ...authoritative };
+
+  const errorX = authoritative.x - guestSelfPrediction.x;
+  const errorY = authoritative.y - guestSelfPrediction.y;
+  const errorDistance = Math.hypot(errorX, errorY);
+  if (errorDistance > 140) {
+    guestSelfPrediction.x = authoritative.x;
+    guestSelfPrediction.y = authoritative.y;
+  } else {
+    const correction = Math.min(1, dt * 7);
+    guestSelfPrediction.x += errorX * correction;
+    guestSelfPrediction.y += errorY * correction;
+  }
+
+  const ix = (keys.d || keys.arrowright ? 1 : 0) -
+    (keys.a || keys.arrowleft ? 1 : 0);
+  const iy = (keys.s || keys.arrowdown ? 1 : 0) -
+    (keys.w || keys.arrowup ? 1 : 0);
+  const length = Math.hypot(ix, iy) || 1;
+  const dx = ix / length;
+  const dy = iy / length;
+
+  if ((ix || iy) && authoritative.stun <= 0) {
+    guestSelfPrediction.facingX = dx;
+    guestSelfPrediction.facingY = dy;
+    const speed = moveSpeed(authoritative);
+    const nextX = guestSelfPrediction.x + dx * speed * dt;
+    const nextY = guestSelfPrediction.y + dy * speed * dt;
+    if (!blocked(nextX, guestSelfPrediction.y, 20))
+      guestSelfPrediction.x = nextX;
+    if (!blocked(guestSelfPrediction.x, nextY, 20))
+      guestSelfPrediction.y = nextY;
+  }
+}
 function guestRenderLoop(now) {
   if (mode !== "local" || isHost || localPhase !== "game") {
     guestRenderRaf = 0;
     return;
   }
   if (stateTarget) {
-    const alpha = Math.min(1, (now - stateReceivedAt) / INTERPOLATION_MS);
-    S = interpolateState(statePrevious, stateTarget, alpha);
+    const dt = Math.min(0.033, (now - guestRenderLast) / 1000 || 0.016);
+    guestRenderLast = now;
+    S = buildGuestDisplayState(now, dt);
     draw();
   }
   guestRenderRaf = requestAnimationFrame(guestRenderLoop);
@@ -577,10 +720,14 @@ function closePeer() {
   connections.forEach((c) => c.close());
   connections = [];
   clearInterval(guestInputTimer);
+  clearInterval(hostWatchdogTimer);
+  clearInterval(hostHeartbeatTimer);
   clearTimeout(guestDisconnectTimer);
   clearTimeout(roundStartTimeout);
   cancelAnimationFrame(guestRenderRaf);
   guestRenderRaf = guestInputTimer = guestDisconnectTimer = 0;
+  hostWatchdogTimer = hostHeartbeatTimer = 0;
+  hostDisconnecting = false;
   disconnectTimers.forEach((timer) => clearTimeout(timer));
   disconnectTimers.clear();
   readyGuestIds.clear();
@@ -628,6 +775,7 @@ function tryStartAfterAbilities() {
   lobbyMembers.forEach((m) => (matchKinds[m.id] = m.kind));
   selectRandomMap();
   localPhase = "game";
+  startHostHeartbeat();
   readyGuestIds.clear();
   connections.forEach(
     (c) => c.open && c.send({ type: "start", count: matchPlayers, mapIndex: activeMapIndex }),
@@ -640,6 +788,9 @@ function startGuestControls() {
   clearInterval(guestInputTimer);
   const send = () => {
     if (!connections[0]?.open) return;
+    // 入力も送信待ちが溜まっている場合は古い入力を捨て、次回の最新入力を優先する。
+    if ((connections[0].dataChannel?.bufferedAmount || 0) > MAX_BUFFERED_BYTES)
+      return;
     connections[0].send({
       type: "input",
       input: { keys: { ...keys }, tackle: tackleQueued, use: false },
@@ -906,11 +1057,12 @@ function start() {
   enterMatchScreen(() => newRound(true));
 }
 function showCountdown(value) {
+  clearTimeout(uiToastTimeout);
   toast.textContent = value === "START" ? "START!" : value;
   toast.style.display = "block";
   toast.style.fontSize = value === "START" ? "32px" : "56px";
   if (value === "START")
-    setTimeout(() => {
+    uiToastTimeout = setTimeout(() => {
       toast.style.display = "none";
       toast.style.fontSize = "";
     }, 650);
@@ -954,7 +1106,12 @@ function networkState() {
 }
 function sendStateTo(connection) {
   const state = networkState();
-  if (state && connection?.open) connection.send(state);
+  if (!state || !connection?.open) return;
+  // 回線が詰まっている時に古い座標を積み上げると数秒の遅延になる。
+  // 次の新しい状態がすぐ届くため、64KB以上なら今回分だけ破棄する。
+  const buffered = connection.dataChannel?.bufferedAmount || 0;
+  if (buffered > MAX_BUFFERED_BYTES) return;
+  connection.send(state);
 }
 function tryBeginSynchronizedRound() {
   if (
@@ -1036,10 +1193,11 @@ function renderScores() {
     .join("");
 }
 function toastMsg(s) {
+  clearTimeout(uiToastTimeout);
   toast.textContent = s;
   toast.style.fontSize = "";
   toast.style.display = "block";
-  setTimeout(() => (toast.style.display = "none"), 800);
+  uiToastTimeout = setTimeout(() => (toast.style.display = "none"), 800);
 }
 // =========================================================
 // 7. プレイヤー入力・タックル
@@ -1668,8 +1826,11 @@ function showResult(finalScores) {
     .join("");
 }
 function end() {
-  if (mode === "local" && isHost)
+  if (mode === "local" && isHost) {
+    clearInterval(hostHeartbeatTimer);
     connections.forEach((c) => c.open && c.send({ type: "end", scores }));
+  }
+  localPhase = "result";
   showResult(scores);
 }
 function replay() {
