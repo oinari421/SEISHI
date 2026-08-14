@@ -476,6 +476,8 @@ function guestData(d) {
       60 - Math.floor(elapsed),
     );
     renderScores();
+    // 補間ループを待たず、受信した最初の状態を必ず描画する。
+    draw();
     if (!guestRenderRaf)
       guestRenderRaf = requestAnimationFrame(guestRenderLoop);
   }
@@ -484,7 +486,7 @@ function guestData(d) {
 }
 function interpolateState(from, to, alpha) {
   if (!to) return from;
-  const result = structuredClone(to);
+  const result = cloneGameState(to);
   if (!from?.swimmers) return result;
   result.swimmers.forEach((o, i) => {
     const a = from.swimmers[i];
@@ -497,6 +499,21 @@ function interpolateState(from, to, alpha) {
     o.facingY = a.facingY + (o.facingY - a.facingY) * alpha;
   });
   return result;
+}
+function cloneGameState(source) {
+  if (!source) return source;
+  return {
+    swimmers: (source.swimmers || []).map((o) => ({
+      ...o,
+      path: (o.path || []).map((p) => ({ ...p })),
+      roomOrder: [...(o.roomOrder || [])],
+      visitedRooms:
+        o.visitedRooms instanceof Set
+          ? [...o.visitedRooms]
+          : [...(o.visitedRooms || [])],
+    })),
+    eggs: (source.eggs || []).map((e) => ({ ...e })),
+  };
 }
 function guestRenderLoop(now) {
   if (mode !== "local" || isHost || localPhase !== "game") {
@@ -925,10 +942,7 @@ function scheduleCountdown(startAt) {
 }
 function networkState() {
   if (!S) return null;
-  const safe = structuredClone(S);
-  safe.swimmers.forEach((o) => {
-    if (o.visitedRooms instanceof Set) o.visitedRooms = [...o.visitedRooms];
-  });
+  const safe = cloneGameState(S);
   return {
     type: "state",
     S: safe,
